@@ -3,7 +3,7 @@ export PATH='your conda envs path'
 save_model='your path'
 
 python ./TFCL/code/main_train.py \
-    --track ASVspoof2019_afe \
+    --track ASVspoof2019_vad \
     --batch_size 4 \
     --lr_det 1e-6 \
     --max_epochs 100 \
