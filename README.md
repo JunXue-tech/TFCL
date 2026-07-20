@@ -4,7 +4,7 @@ Official implementation of **TFCL**, a consistency-learning framework for robust
 
 > **Paper:** *Time-Frequency Consistency Learning for Robust Speech Deepfake Detection*  
 > **Authors:** *Jun Xue, Zhuolin Yi, Yanzhen Ren, Yihuan Huang, Jiayu Xiong, Yi Chai, Guanxiang Feng, Jiajun Liu, Tong Zhang*  
-> **Venue:** *[To be added]*
+
 
 ## Overview
 
