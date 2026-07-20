@@ -17,7 +17,7 @@ class SSLModel(nn.Module):
     def __init__(self, device):
         super(SSLModel, self).__init__()
 
-        cp_path = '/data2/yzl/04_online_data_fsd/03_SSL_Anti_spoofing/pretrained_model/xlsr2_300m.pt'
+        cp_path = 'xlsr2_300m.pt'
         model, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([cp_path])
         self.model = model[0]
         self.device = device
