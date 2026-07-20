@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+conda_env/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and experiment outputs
+*.log
+logs/
+log/
+runs/
+wandb/
+tensorboard/
+outputs/
+output/
+exp/
+experiments/
+results/
+scores/
+
+# Model checkpoints and large binaries
+*.pt
+*.pth
+*.ckpt
+*.bin
+checkpoints/
+pretrained_models/
+
+# Datasets and generated audio
+data/
+dataset/
+datasets/
+*.wav
+*.flac
+*.mp3
+*.tar
+*.tar.gz
+*.zip
+
+# Temporary/cache files
+.cache/
+tmp/
+temp/
+*.tmp
