@@ -10,7 +10,7 @@ from tqdm import tqdm
 from core_scripts.startup_config import set_random_seed
 from data_utils_SSL import genSpoof_list, Dataset_ASVspoof2021_eval
 from evaluation2019 import calculate_cm_eer
-from model2 import Model
+from model import Model
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
