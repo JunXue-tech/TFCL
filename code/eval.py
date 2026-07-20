@@ -15,12 +15,12 @@ from model import Model
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 try:
-    from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, roc_curve
+    from sklearn.metrics import roc_auc_score
     SKLEARN_AVAILABLE = True
 except Exception:
     SKLEARN_AVAILABLE = False
 
-
+ 
 def label_to_int(label_str: str):
     """
     Convert protocol label to int.
@@ -91,131 +91,201 @@ def calculate_auc_from_score_file(score_file: str) -> float:
     return float(auc)
 
 
-def compute_f1_acc_from_arrays(labels, preds):
-    labels = np.asarray(labels, dtype=np.int64)
-    preds = np.asarray(preds, dtype=np.int64)
-
-    if len(labels) == 0:
-        raise RuntimeError("No labels found for F1/ACC computation.")
-
-    if SKLEARN_AVAILABLE:
-        f1 = f1_score(labels, preds, pos_label=1) * 100.0
-        acc = accuracy_score(labels, preds) * 100.0
-        return float(f1), float(acc)
-
-    tp = np.sum((labels == 1) & (preds == 1))
-    fp = np.sum((labels == 0) & (preds == 1))
-    fn = np.sum((labels == 1) & (preds == 0))
-    acc = np.mean(labels == preds) * 100.0
-
-    precision = tp / (tp + fp + 1e-12)
-    recall = tp / (tp + fn + 1e-12)
-    f1 = 2.0 * precision * recall / (precision + recall + 1e-12)
-    return float(f1 * 100.0), float(acc)
+# Parameters used only by paired TFCL training. None of these modules is
+# traversed by Model.forward(x) during single-branch inference.
+AUXILIARY_PREFIXES = (
+    "bidirectional_attn_T.",
+    "bidirectional_attn_D.",   # legacy TFCL checkpoint
+    "feature_proj_d.",         # current feature-domain projection
+)
 
 
-def compute_eer_and_threshold(labels, scores):
+def _torch_load_compat(path: str, map_location="cpu"):
     """
-    labels: 0/1, bonafide=1, spoof=0
-    scores: larger -> more bonafide
-    Returns:
-        eer_percent, eer_threshold
+    Load checkpoints across PyTorch versions.
+
+    PyTorch >= 2.6 exposes ``weights_only`` explicitly, while older versions
+    do not accept the argument.
     """
-    labels = np.asarray(labels, dtype=np.int64)
-    scores = np.asarray(scores, dtype=np.float64)
-
-    uniq = np.unique(labels)
-    if len(uniq) < 2:
-        raise RuntimeError("EER cannot be computed because only one class is present.")
-
-    if SKLEARN_AVAILABLE:
-        fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
-        fnr = 1.0 - tpr
-        idx = np.nanargmin(np.abs(fnr - fpr))
-        eer = (fpr[idx] + fnr[idx]) / 2.0
-        eer_threshold = thresholds[idx]
-        return float(eer * 100.0), float(eer_threshold)
-
-    thresholds = np.unique(scores)
-    best_idx = 0
-    best_gap = 1e18
-    best_fpr = None
-    best_fnr = None
-
-    pos_mask = labels == 1
-    neg_mask = labels == 0
-    n_pos = np.sum(pos_mask)
-    n_neg = np.sum(neg_mask)
-
-    for i, thr in enumerate(thresholds):
-        preds = (scores >= thr).astype(np.int64)
-        fp = np.sum((preds == 1) & neg_mask)
-        fn = np.sum((preds == 0) & pos_mask)
-
-        fpr = fp / (n_neg + 1e-12)
-        fnr = fn / (n_pos + 1e-12)
-        gap = abs(fnr - fpr)
-
-        if gap < best_gap:
-            best_gap = gap
-            best_idx = i
-            best_fpr = fpr
-            best_fnr = fnr
-
-    eer = (best_fpr + best_fnr) / 2.0
-    eer_threshold = thresholds[best_idx]
-    return float(eer * 100.0), float(eer_threshold)
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
-def unwrap_state_dict(sd):
+def unwrap_state_dict(checkpoint):
     """
-    Support common checkpoint layouts from training:
-    1) raw state_dict
-    2) {'state_dict': ...}
-    3) {'model': ...}
-    4) {'model_state_dict': ...}
-    5) {'det_model': ...}
+    Support common training/inference checkpoint layouts:
+      1) raw state_dict
+      2) {"state_dict": ...}
+      3) {"model": ...}
+      4) {"model_state_dict": ...}
+      5) {"det_model": ...}
     """
-    if not isinstance(sd, dict):
-        raise RuntimeError(f"Checkpoint is not a dict, got {type(sd)}")
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(
+            f"Checkpoint must be a dict, but got {type(checkpoint).__name__}"
+        )
 
-    for k in ["det_model", "state_dict", "model", "model_state_dict"]:
-        if k in sd and isinstance(sd[k], dict):
-            return sd[k]
+    for key in ("det_model", "state_dict", "model", "model_state_dict"):
+        value = checkpoint.get(key)
+        if isinstance(value, dict):
+            return value
 
-    return sd
-
-
-def strip_module_prefix_if_needed(state_dict):
-    new_sd = {}
-    for k, v in state_dict.items():
-        nk = k[7:] if k.startswith("module.") else k
-        new_sd[nk] = v
-    return new_sd
+    return checkpoint
 
 
-def load_model_checkpoint(model, ckpt_path: str, device: str = "cpu"):
+def normalize_state_dict_keys(state_dict):
+    """
+    Remove wrappers introduced by DDP/torch.compile.
+
+    The loop is intentional because keys may be nested as
+    ``module._orig_mod.<parameter>``.
+    """
+    normalized = {}
+
+    for key, value in state_dict.items():
+        if not isinstance(key, str):
+            continue
+        if not torch.is_tensor(value):
+            continue
+
+        new_key = key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "_orig_mod."):
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix):]
+                    changed = True
+
+        if new_key in normalized:
+            raise RuntimeError(
+                f"Duplicate parameter after prefix normalization: {new_key}"
+            )
+        normalized[new_key] = value
+
+    if not normalized:
+        raise RuntimeError("No tensor parameters were found in the checkpoint.")
+
+    return normalized
+
+
+def is_auxiliary_key(key: str) -> bool:
+    return key.startswith(AUXILIARY_PREFIXES)
+
+
+def load_model_checkpoint(
+    model,
+    ckpt_path: str,
+    device: str = "cpu",
+    allow_partial: bool = False,
+):
+    """
+    Load only the parameters required by single-branch inference.
+
+    This loader supports both:
+      * original paired-training checkpoints containing TFCL-only modules;
+      * converted inference checkpoints containing only SSL + AASIST weights.
+
+    Auxiliary TFCL parameters are ignored deliberately. Missing or
+    shape-mismatched inference parameters remain fatal by default.
+    """
+    del device  # checkpoint is loaded on CPU to avoid temporary GPU duplication
+
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    raw_ckpt = torch.load(ckpt_path, map_location=device)
-    state_dict = unwrap_state_dict(raw_ckpt)
-    state_dict = strip_module_prefix_if_needed(state_dict)
+    raw_ckpt = _torch_load_compat(ckpt_path, map_location="cpu")
+    checkpoint_state = normalize_state_dict_keys(unwrap_state_dict(raw_ckpt))
+    model_state = model.state_dict()
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    required_inference_keys = {
+        key for key in model_state.keys() if not is_auxiliary_key(key)
+    }
 
-    print(f"[Loader] Loaded checkpoint: {ckpt_path}")
-    print(f"[Loader] missing keys: {len(missing)}")
-    if len(missing) > 0:
-        print(f"[Loader] missing example: {missing[:20]}")
-    print(f"[Loader] unexpected keys: {len(unexpected)}")
-    if len(unexpected) > 0:
-        print(f"[Loader] unexpected example: {unexpected[:20]}")
+    loadable_state = {}
+    ignored_auxiliary = []
+    unexpected_inference = []
+    shape_mismatches = []
 
-    if len(unexpected) > 0:
-        raise RuntimeError(
-            "Checkpoint contains unexpected keys. This usually means eval model code and training model code are inconsistent."
+    for key, value in checkpoint_state.items():
+        if is_auxiliary_key(key):
+            ignored_auxiliary.append(key)
+            continue
+
+        if key not in model_state:
+            unexpected_inference.append(key)
+            continue
+
+        expected_shape = tuple(model_state[key].shape)
+        checkpoint_shape = tuple(value.shape)
+        if checkpoint_shape != expected_shape:
+            shape_mismatches.append(
+                (key, checkpoint_shape, expected_shape)
+            )
+            continue
+
+        loadable_state[key] = value
+
+    missing_inference = sorted(required_inference_keys - set(loadable_state))
+
+    print(f"[Loader] Checkpoint: {ckpt_path}")
+    print(f"[Loader] checkpoint tensor keys : {len(checkpoint_state)}")
+    print(f"[Loader] inference keys loaded  : {len(loadable_state)}")
+    print(f"[Loader] auxiliary keys ignored : {len(ignored_auxiliary)}")
+    if ignored_auxiliary:
+        print(f"[Loader] ignored example        : {ignored_auxiliary[:20]}")
+    print(f"[Loader] unknown inference keys : {len(unexpected_inference)}")
+    if unexpected_inference:
+        print(f"[Loader] unknown example        : {unexpected_inference[:20]}")
+    print(f"[Loader] shape mismatches       : {len(shape_mismatches)}")
+    if shape_mismatches:
+        print(f"[Loader] mismatch example       : {shape_mismatches[:10]}")
+    print(f"[Loader] missing inference keys : {len(missing_inference)}")
+    if missing_inference:
+        print(f"[Loader] missing example        : {missing_inference[:20]}")
+
+    errors = []
+    if unexpected_inference:
+        errors.append(
+            f"{len(unexpected_inference)} unknown non-auxiliary checkpoint keys"
         )
+    if shape_mismatches:
+        errors.append(
+            f"{len(shape_mismatches)} inference parameter shape mismatches"
+        )
+    if missing_inference:
+        errors.append(
+            f"{len(missing_inference)} required inference parameters are missing"
+        )
+
+    if errors and not allow_partial:
+        raise RuntimeError(
+            "Inference checkpoint validation failed: "
+            + "; ".join(errors)
+            + ". Use the checkpoint conversion script first. "
+              "Use --allow_partial_checkpoint only for debugging, not for "
+              "reported evaluation."
+        )
+
+    incompatible = model.load_state_dict(loadable_state, strict=False)
+
+    # Missing auxiliary parameters are expected because the current Model
+    # class still instantiates training-only modules.
+    residual_missing = [
+        key for key in incompatible.missing_keys if not is_auxiliary_key(key)
+    ]
+    residual_unexpected = list(incompatible.unexpected_keys)
+
+    if (residual_missing or residual_unexpected) and not allow_partial:
+        raise RuntimeError(
+            "Model loading still has non-auxiliary incompatibilities: "
+            f"missing={residual_missing[:20]}, "
+            f"unexpected={residual_unexpected[:20]}"
+        )
+
+    print("[Loader] Inference checkpoint loaded successfully.")
 
 
 def produce_evaluation_file(
@@ -262,7 +332,6 @@ def produce_evaluation_file(
     assert len(trial_lines) == len(fname_list) == len(score_list), \
         f"trial={len(trial_lines)} fname={len(fname_list)} score={len(score_list)}"
 
-    labels = []
     with open(save_path, "w", encoding="utf-8") as fh:
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
             parts = trl.strip().split()
@@ -272,25 +341,26 @@ def produce_evaluation_file(
             _, utt_id2, _, src, key = parts[:5]
             assert fn == utt_id2, f"utt mismatch: {fn} vs {utt_id2}"
             fh.write(f"{utt_id2} {src} {key} {sco}\n")
-            labels.append(label_to_int(key))
 
     print(f"Scores saved to {save_path}")
-    return np.asarray(labels, dtype=np.int64), np.asarray(score_list, dtype=np.float64)
 
 
-def append_summary(summary_path, dataset_name, eer, auc, f1, acc, eer_threshold,
-                   model_path, protocol_path, wav_path):
+def append_summary(
+    summary_path,
+    dataset_name,
+    eer,
+    auc,
+    model_path,
+    protocol_path,
+    wav_path,
+):
     with open(summary_path, "a", encoding="utf-8") as f:
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Model: {model_path}\n")
         f.write(f"Protocol: {protocol_path}\n")
         f.write(f"Wav root: {wav_path}\n")
         f.write(f"EER: {eer:.4f}%\n")
-        f.write(f"AUC: {auc:.4f}%\n")
-        f.write(f"F1@EER-threshold: {f1:.4f}%\n")
-        f.write(f"ACC@EER-threshold: {acc:.4f}%\n")
-        f.write(f"EER threshold: {eer_threshold:.8f}\n\n")
-
+        f.write(f"AUC: {auc:.4f}%\n\n")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Pure evaluation for paired-training anti-spoof model')
@@ -321,6 +391,15 @@ if __name__ == '__main__':
     parser.add_argument('--align_weight', type=float, default=1.0)
     parser.add_argument('--layer', type=int, default=24,
                         help='Kept only for argparse compatibility if external scripts pass this arg')
+
+    parser.add_argument(
+        '--allow_partial_checkpoint',
+        action='store_true',
+        help=(
+            'Allow missing/unknown inference parameters. Intended only for '
+            'checkpoint debugging; do not use for reported evaluation.'
+        )
+    )
 
     parser.add_argument('--cudnn-deterministic-toggle', action='store_false',
                         default=True,
@@ -369,14 +448,20 @@ if __name__ == '__main__':
     )
 
     model = Model(args, device).to(device)
-    load_model_checkpoint(model, args.model_path, device=device)
+    load_model_checkpoint(
+        model,
+        args.model_path,
+        device=device,
+        allow_partial=args.allow_partial_checkpoint,
+    )
     model.eval()
+
     print(f'Model loaded: {args.model_path}')
 
     eval_score_path = os.path.join(args.output_dir, f"{args.dataset}.txt")
     summary_path = os.path.join(args.output_dir, "summary.txt")
 
-    labels_np, scores_np = produce_evaluation_file(
+    produce_evaluation_file(
         eval_loader,
         model,
         device,
@@ -385,19 +470,12 @@ if __name__ == '__main__':
     )
 
     eval_eer_official = calculate_cm_eer(eval_score_path)
-    eval_eer_from_scores, eer_threshold = compute_eer_and_threshold(labels_np, scores_np)
-    preds_at_eer = (scores_np >= eer_threshold).astype(np.int64)
-    eval_f1, eval_acc = compute_f1_acc_from_arrays(labels_np, preds_at_eer)
     eval_auc = calculate_auc_from_score_file(eval_score_path) * 100.0
 
     print("\n========== Evaluation Result ==========")
     print(f"Dataset              : {args.dataset}")
     print(f"EER (official)       : {eval_eer_official:.4f}%")
-    print(f"EER (from scores)    : {eval_eer_from_scores:.4f}%")
-    print(f"EER threshold        : {eer_threshold:.8f}")
     print(f"AUC                  : {eval_auc:.4f}%")
-    print(f"F1 @ EER-threshold   : {eval_f1:.4f}%")
-    print(f"ACC @ EER-threshold  : {eval_acc:.4f}%")
     print(f"Scores               : {eval_score_path}")
     print(f"Summary              : {summary_path}")
     print("=======================================\n")
@@ -407,9 +485,6 @@ if __name__ == '__main__':
         dataset_name=args.dataset,
         eer=eval_eer_official,
         auc=eval_auc,
-        f1=eval_f1,
-        acc=eval_acc,
-        eer_threshold=eer_threshold,
         model_path=args.model_path,
         protocol_path=args.protocol_path,
         wav_path=args.wav_path
