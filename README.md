@@ -2,8 +2,8 @@
 
 Official implementation of **TFCL**, a consistency-learning framework for robust speech deepfake detection under acoustic front-end (AFE) distortions.
 
-> **Paper:** *[Paper title will be added after publication]*  
-> **Authors:** *[To be added]*  
+> **Paper:** *Time-Frequency Consistency Learning for Robust Speech Deepfake Detection*  
+> **Authors:** *Jun Xue, Zhuolin Yi, Yanzhen Ren, Yihuan Huang, Jiayu Xiong, Yi Chai, Guanxiang Feng, Jiajun Liu, Tong Zhang*  
 > **Venue:** *[To be added]*
 
 ## Overview
@@ -166,10 +166,10 @@ The citation information will be added after the paper metadata becomes publicly
 
 ```bibtex
 @article{tfcl,
-  title   = {To be added},
-  author  = {To be added},
-  journal = {To be added},
-  year    = {To be added}
+  title   = {Time-Frequency Consistency Learning for Robust Speech Deepfake Detection},
+  author  = {Jun Xue, Zhuolin Yi, Yanzhen Ren, Yihuan Huang, Jiayu Xiong, Yi Chai, Guanxiang Feng, Jiajun Liu, Tong Zhang},
+  journal = {ACM MM 2026},
+  year    = {2026}
 }
 ```
 
